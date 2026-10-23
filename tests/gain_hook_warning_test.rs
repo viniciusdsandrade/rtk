@@ -270,3 +270,79 @@ fn an_outdated_hook_is_reported_on_every_view() {
         );
     }
 }
+
+/// A legacy `hooks/rtk-rewrite.sh` beside the binary hook in `claude_dir`, with
+/// a settings.json that registers both: what an upgrade from the script hook
+/// leaves until `rtk init -g` migrates it. Returns the script's path.
+fn legacy_hook_beside_binary_hook(claude_dir: &Path) -> std::path::PathBuf {
+    let hooks = claude_dir.join("hooks");
+    std::fs::create_dir_all(&hooks).expect("create hooks dir");
+    let script = hooks.join("rtk-rewrite.sh");
+    std::fs::write(&script, b"#!/usr/bin/env bash\n# rtk-hook-version: 4\n")
+        .expect("write legacy hook");
+    let command = script.to_str().expect("utf-8 temp path");
+    let settings = serde_json::json!({"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]},
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
+    ]}});
+    std::fs::write(claude_dir.join("settings.json"), settings.to_string())
+        .expect("write settings.json");
+    script
+}
+
+/// Run `rtk init -g --auto-patch` the way `gain_split_env` runs `rtk gain`.
+fn init_global_env(home: &Path, env: &[(&str, &str)]) {
+    let mut cmd = common::rtk_command();
+    cmd.args(["init", "-g", "--auto-patch"])
+        .envs(isolating_env(home))
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().expect("spawn rtk init -g");
+    assert!(
+        output.status.success(),
+        "rtk init -g failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn init_clears_an_outdated_hook_in_the_claude_config_dir() {
+    // `status()` reads the hook from `CLAUDE_CONFIG_DIR` when it is set, so
+    // the migration `rtk init -g` runs must clean that directory; unset, it
+    // still cleans `~/.claude`.
+    for (name, custom) in [("claude-config", true), (".claude", false)] {
+        let home = tempfile::tempdir().expect("tempdir");
+        let claude_dir = home.path().join(name);
+        let script = legacy_hook_beside_binary_hook(&claude_dir);
+        let dir = claude_dir.to_str().expect("utf-8 temp path");
+        let custom_env = [("CLAUDE_CONFIG_DIR", dir)];
+        let env: &[(&str, &str)] = if custom { &custom_env } else { &[] };
+
+        let (out, err) = gain_split_env(&["gain"], home.path(), env);
+        let before = format!("{out}{err}");
+        assert_eq!(
+            count(&before, "[warn] Hook outdated"),
+            1,
+            "{name}: the leftover script must read as outdated: {before}"
+        );
+
+        init_global_env(home.path(), env);
+        assert!(!script.exists(), "{name}: legacy script left behind");
+        let settings_path = claude_dir.join("settings.json");
+        let settings = std::fs::read_to_string(settings_path).expect("read settings.json");
+        assert!(
+            !settings.contains("rtk-rewrite.sh") && settings.contains("rtk hook claude"),
+            "{name}: settings.json must keep only the binary hook: {settings}"
+        );
+        let (out, err) = gain_split_env(&["gain"], home.path(), env);
+        let after = format!("{out}{err}");
+        assert_eq!(
+            count(&after, "[warn] Hook outdated"),
+            0,
+            "{name}: rtk init -g must clear the warning: {after}"
+        );
+    }
+}
